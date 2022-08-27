@@ -10,8 +10,8 @@ import plotly.io as pio
 pio.renderers.default = "browser"
 
 
-MOVIE_FEATURES = ['movie_title', 'movie_genres']
-USER_FEATURES = ['user_id', 'timestamp']
+MOVIE_FEATURES = ['movie_title', 'movie_genres', 'movie_title_text']
+USER_FEATURES = ['user_id', 'timestamp', 'bucketized_user_age']
 
 
 class UserModel(tf.keras.Model):
@@ -28,8 +28,14 @@ class UserModel(tf.keras.Model):
         if 'timestamp' in additional_features:
             self.additional_embeddings['timestamp'] = tf.keras.Sequential([
                 tf.keras.layers.Discretization(additional_feature_info['timestamp_buckets'].tolist()),
-                tf.keras.layers.Embedding(len(additional_feature_info['timestamp_buckets']) + 1, 32),
+                tf.keras.layers.Embedding(len(additional_feature_info['timestamp_buckets']) + 1, embedding_size),
             ])
+
+        if 'bucketized_user_age' in additional_features:
+            self.user_age_normalizer = tf.keras.layers.Normalization(axis=None)
+            self.user_age_normalizer.adapt(additional_feature_info['bucketized_user_age'])
+            self.additional_embeddings['bucketized_user_age'] = tf.keras.Sequential([self.user_age_normalizer,
+                                                                                     tf.keras.layers.Reshape([1])])
 
     def call(self, inputs):
         return tf.concat([self.user_embedding(inputs['user_id'])] +
@@ -50,8 +56,18 @@ class MovieModel(tf.keras.Model):
 
         if 'movie_genres' in additional_features:
             self.additional_embeddings['movie_genres'] = tf.keras.Sequential([
-                tf.keras.layers.Embedding(len(additional_feature_info['unique_movie_genres']) + 1, 32),
+                tf.keras.layers.Embedding(max(additional_feature_info['unique_movie_genres']) + 1, embedding_size),
                 tf.keras.layers.Lambda(lambda x: tf.math.reduce_mean(x, axis=1))
+            ])
+
+        if 'movie_title_text' in additional_features:
+            max_tokens = 10_000
+            self.title_vectorizer = tf.keras.layers.TextVectorization(max_tokens=max_tokens)
+            self.title_vectorizer.adapt(unique_movie_titles)
+            self.additional_embeddings['movie_title_text'] = tf.keras.Sequential([
+                self.title_vectorizer,
+                tf.keras.layers.Embedding(max_tokens, embedding_size, mask_zero=True),
+                tf.keras.layers.GlobalAveragePooling1D(),
             ])
 
     def call(self, inputs):
@@ -107,59 +123,86 @@ class MovieLensModel(tfrs.models.Model):
         return self.task(query_embeddings, movie_embeddings, compute_metrics=not training)
 
 
-def get_movielens_model(num_epochs, embedding_size, layer_sizes, additional_features, movies, retrain):
-    folder_name = f'saved_models/{num_epochs}_{embedding_size}_{layer_sizes}_{additional_features}'
-    if os.path.exists(folder_name) and not retrain:
-        model = tf.saved_model.load(f'{folder_name}/model')
-        with open(f'{folder_name}/model_history.pkl', 'rb') as f:
-            model_history = pickle.load(f)
-        return model, model_history
-    else:
-        return train_movielens_model(num_epochs, embedding_size, layer_sizes, additional_features, movies, folder_name)
+class MovieLensTrainer:
+    def __init__(self, num_epochs, embedding_size, layer_sizes, additional_feature_sets, retrain):
+        self.num_epochs = num_epochs
+        self.embedding_size = embedding_size
+        self.layer_sizes = tuple(layer_sizes)
+        self.additional_feature_sets = additional_feature_sets
+        self.retrain = retrain
+        self.movies = (tfds.load("movielens/1m-movies", split="train")
+                       .map(lambda x: {**x, 'movie_title_text': x['movie_title']}))
+        self.ratings = (tfds.load("movielens/1m-ratings", split="train")
+                        .map(lambda x: {**x, 'movie_title_text': x['movie_title']})
+                        .shuffle(100_000, seed=42, reshuffle_each_iteration=False))
+        all_ratings = list(self.ratings.map(lambda x: {'movie_title': x["movie_title"],
+                                                       'user_id': x['user_id'],
+                                                       'bucketized_user_age': x['bucketized_user_age'],
+                                                       'movie_genres': x['movie_genres']})
+                           .apply(tf.data.experimental.dense_to_ragged_batch(len(self.ratings))))[0]
+        # self.unique_movie_titles = np.unique(np.concatenate(list(self.ratings.map(lambda x: x["movie_title"]).batch(1000))))
+        self.unique_movie_titles = np.unique(all_ratings['movie_title'])
+        self.unique_movie_genres = np.unique(np.concatenate(
+            list(self.ratings.map(lambda x: x["movie_genres"]).as_numpy_iterator())))
+        # self.unique_user_ids = np.unique(np.concatenate(list(self.ratings.map(lambda x: x["user_id"]).batch(1000))))
+        self.unique_user_ids = np.unique(all_ratings['user_id'])
 
+        self.timestamps = np.concatenate(list(self.ratings.map(lambda x: x["timestamp"]).batch(100)))
+        self.max_timestamp = self.timestamps.max()
+        self.min_timestamp = self.timestamps.min()
+        self.additional_feature_info = {'timestamp_buckets': np.linspace(self.min_timestamp, self.max_timestamp,
+                                                                         num=1000),
+                                        'unique_movie_genres': self.unique_movie_genres,
+                                        'bucketized_user_age': all_ratings['bucketized_user_age']}
 
-def train_movielens_model(num_epochs, embedding_size, layer_sizes, additional_features, movies, folder_name):
-    ratings = (tfds.load("movielens/100k-ratings", split="train")
-               .shuffle(100_000, seed=42, reshuffle_each_iteration=False))
-    unique_movie_titles = np.unique(np.concatenate(list(ratings.map(lambda x: x["movie_title"]).batch(1000))))
-    unique_movie_genres = np.unique(np.concatenate(list(ratings.map(lambda x: x["movie_genres"]).as_numpy_iterator())))
-    unique_user_ids = np.unique(np.concatenate(list(ratings.map(lambda x: x["user_id"]).batch(1000))))
+    def train_all_models(self):
+        models = {}
+        for additional_features in self.additional_feature_sets:
+            if len(additional_features) == 0:
+                continue
+            model, history = self.get_movielens_model(tuple(additional_features))
+            models[tuple(additional_features)] = (model, history)
+        return models
 
-    timestamps = np.concatenate(list(ratings.map(lambda x: x["timestamp"]).batch(100)))
-    max_timestamp = timestamps.max()
-    min_timestamp = timestamps.min()
-    additional_feature_info = {'timestamp_buckets': np.linspace(min_timestamp, max_timestamp, num=1000),
-                               'unique_movie_genres': unique_movie_genres}
+    def get_movielens_model(self, additional_features):
+        folder_name = f'saved_models/{self.num_epochs}_{self.embedding_size}_{self.layer_sizes}' \
+                      f'_{tuple(sorted(additional_features))}'
+        if os.path.exists(folder_name) and not self.retrain:
+            model = tf.saved_model.load(f'{folder_name}/model')
+            with open(f'{folder_name}/model_history.pkl', 'rb') as f:
+                model_history = pickle.load(f)
+            return model, model_history
+        else:
+            return self.train_movielens_model(additional_features, folder_name)
 
-    trainset = (ratings
-                .take(80_000)
-                .shuffle(100_000)
-                .apply(tf.data.experimental.dense_to_ragged_batch(2048))
-                .cache())
-
-    testset = (ratings
-               .skip(80_000)
-               .take(20_000)
-               .apply(tf.data.experimental.dense_to_ragged_batch(2048))
-               .cache())
-
-    model = MovieLensModel(layer_sizes, movies, unique_movie_titles, unique_user_ids, embedding_size,
-                           additional_features=additional_features,
-                           additional_feature_info=additional_feature_info)
-    model.compile(optimizer=tf.keras.optimizers.Adagrad(0.1), run_eagerly=True)
-
-    model_history = model.fit(
-        trainset,
-        validation_data=testset,
-        validation_freq=5,
-        epochs=num_epochs,
-        verbose=1)
-    model.task = tfrs.tasks.Retrieval()
-    model.compile()
-    tf.saved_model.save(model, f'{folder_name}/model')
-    with open(f'{folder_name}/model_history.pkl', 'wb') as f:
-        pickle.dump(model_history.history, f)
-    return model, model_history.history
+    def train_movielens_model(self, additional_features, folder_name):
+        trainset = (self.ratings
+                    .take(80_000)
+                    .shuffle(100_000)
+                    .apply(tf.data.experimental.dense_to_ragged_batch(2048))
+                    .cache())
+        testset = (self.ratings
+                   .skip(80_000)
+                   .take(20_000)
+                   .apply(tf.data.experimental.dense_to_ragged_batch(2048))
+                   .cache())
+        model = MovieLensModel(self.layer_sizes, self.movies, self.unique_movie_titles, self.unique_user_ids,
+                               self.embedding_size,
+                               additional_features=additional_features,
+                               additional_feature_info=self.additional_feature_info)
+        model.compile(optimizer=tf.keras.optimizers.Adagrad(0.1), run_eagerly=True)
+        model_history = model.fit(
+            trainset,
+            validation_data=testset,
+            validation_freq=5,
+            epochs=self.num_epochs,
+            verbose=1)
+        model.task = tfrs.tasks.Retrieval()
+        model.compile()
+        tf.saved_model.save(model, f'{folder_name}/model')
+        with open(f'{folder_name}/model_history.pkl', 'wb') as f:
+            pickle.dump(model_history.history, f)
+        return model, model_history.history
 
 
 def plot_training_runs(model_histories):
@@ -179,35 +222,31 @@ if __name__ == '__main__':
     parser.add_argument('--num_epochs', type=int, default=10)
     parser.add_argument('--embedding_size', type=int, default=32)
     parser.add_argument('--layer_sizes', nargs='+', default=[32])
-    parser.add_argument('--additional_feature_sets', nargs='+', default=[[]], help='options: timestamp', action='append')
+    parser.add_argument('--additional_feature_sets', nargs='+', help='options: timestamp', action='append')
     parser.add_argument('--generate_recommendations_for_user', type=int, default=-1)
     parser.add_argument('--retrain', action='store_true')
     args = parser.parse_args()
 
-    movies = (tfds.load("movielens/100k-movies", split="train"))
+    if ['None'] in args.additional_feature_sets:
+        args.additional_feature_sets.remove(['None'])
+        args.additional_feature_sets.append([])
 
-    models = {}
-    for additional_features in args.additional_feature_sets:
-        if len(additional_features) == 0:
-            continue
-        model, history = get_movielens_model(args.num_epochs, args.embedding_size, tuple(args.layer_sizes),
-                                                     tuple(additional_features), movies, args.retrain)
-        accuracy = history["val_factorized_top_k/top_100_categorical_accuracy"][-1]
-        models[tuple(additional_features)] = (model, history)
+    movielens_trainer = MovieLensTrainer(args.num_epochs,
+                                         args.embedding_size,
+                                         args.layer_sizes,
+                                         args.additional_feature_sets,
+                                         args.retrain)
+    models = movielens_trainer.train_all_models()
+    fig = plot_training_runs({k: v[1] for k, v in models.items()})
+    fig.show()
 
-    fig = plot_training_runs({k: m[1] for k, m in models.items()})
-    # fig.show()
-
-    # index = tfrs.layers.factorized_top_k.BruteForce(model.query_model)
+    first_model = models[list(models.keys())[0]][0]
     index = tfrs.layers.factorized_top_k.BruteForce()
-    # index.index_from_dataset(
-    #     tf.data.Dataset.zip((movies.apply(tf.data.experimental.dense_to_ragged_batch(100)),
-    #                          movies.apply(tf.data.experimental.dense_to_ragged_batch(100)).map(model.candidate_model)))
-    # )
-    index.index_from_dataset(movies.apply(tf.data.experimental.dense_to_ragged_batch(100)).map(model.candidate_model))
-    # _, titles = index({'user_id': ['42'], 'timestamp': [881108229]})
-    _, titles = index(model.query_model({'user_id': ['42'], 'timestamp': [881108229]}))
-    print(f"Recommendations for user 42: {titles[0, :3]}")
+    index.index_from_dataset(movielens_trainer.movies.apply(tf.data.experimental.dense_to_ragged_batch(100)).map(first_model.candidate_model))
+    _, titles = index(first_model.query_model({'user_id': ['42'], 'timestamp': [881108229]}))
+    title_names = np.array([movielens_trainer.unique_movie_titles[x] for x in titles.numpy().squeeze()])
+
+    print(f"Recommendations for user 42: {title_names[0, :3]}")
     print(f'Run settings: {vars(args)}')
-    print(f"Top-100 accuracy: {accuracy:.2f}")
+    # print(f"Top-100 accuracy: {accuracy:.2f}")
 
