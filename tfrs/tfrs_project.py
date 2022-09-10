@@ -14,7 +14,7 @@ pio.renderers.default = "browser"
 
 
 ia = Cinemagoer()
-MOVIE_FEATURES = ['movie_title', 'movie_genres', 'movie_title_text']
+MOVIE_FEATURES = ['movie_title', 'movie_genres', 'movie_title_text', 'movie_length']
 USER_FEATURES = ['user_id', 'timestamp', 'bucketized_user_age']
 
 
@@ -74,6 +74,12 @@ class MovieModel(tf.keras.Model):
                 tf.keras.layers.GlobalAveragePooling1D(),
             ])
 
+        if 'movie_length' in additional_features:
+            self.movie_length_normalizer = tf.keras.layers.Normalization(axis=None)
+            self.movie_length_normalizer.adapt(additional_feature_info['movie_length'])
+            self.additional_embeddings['movie_length'] = tf.keras.Sequential([self.movie_length_normalizer,
+                                                                              tf.keras.layers.Reshape([1])])
+
     def call(self, inputs):
         return tf.concat([self.title_embedding(inputs['movie_title'])] +
                          [self.additional_embeddings[k](inputs[k]) for k in self.additional_embeddings],
@@ -131,7 +137,7 @@ def get_movie_length_wrapper(movie_title):
     return get_movie_length(movie_title.numpy().decode())
 
 
-@cachier()
+@cachier(separate_files=True)
 def get_movie_length(movie_title_str):
     movielens_year = int(re.search('\((\d+)\)', movie_title_str).groups(0)[0])
     try:
@@ -155,6 +161,13 @@ def get_movie_length(movie_title_str):
             return 90
 
 
+def add_movie_length_to_dataset(tf_dataset):
+    return (tf_dataset.map(lambda x: {**x, 'movie_length': tf.py_function(func=get_movie_length_wrapper,
+                                                                         inp=[x['movie_title']],
+                                                                         Tout=[tf.int32])})
+                      .map(lambda x: {**x, 'movie_length': x['movie_length'][0] if x['movie_length'] > 0 else 90}))
+
+
 class MovieLensTrainer:
     def __init__(self, num_epochs, embedding_size, layer_sizes, additional_feature_sets, retrain):
         self.num_epochs = num_epochs
@@ -162,20 +175,13 @@ class MovieLensTrainer:
         self.layer_sizes = tuple(layer_sizes)
         self.additional_feature_sets = additional_feature_sets
         self.retrain = retrain
-        self.movies = (tfds.load("movielens/1m-movies", split="train")
-                       .map(lambda x: {**x,
-                                       'movie_title_text': x['movie_title'],
-                                       'movie_length': tf.py_function(func=get_movie_length_wrapper,
-                                                                      inp=[x['movie_title']],
-                                                                      Tout=[tf.int32])}))
-        self.ratings = (tfds.load("movielens/1m-ratings", split="train")
-                        .map(lambda x: {**x, 'movie_title_text': x['movie_title']})
-                        .shuffle(100_000, seed=42, reshuffle_each_iteration=False))
+        self.get_datasets()
         self.all_ratings = list(self.ratings.map(lambda x: {'movie_title': x["movie_title"],
                                                             'user_id': x['user_id'],
                                                             'bucketized_user_age': x['bucketized_user_age'],
                                                             'movie_genres': x['movie_genres'],
-                                                            'timestamp': x['timestamp']})
+                                                            'timestamp': x['timestamp'],
+                                                            'movie_length': x['movie_length']})
                                 .apply(tf.data.experimental.dense_to_ragged_batch(len(self.ratings))))[0]
         all_movies = list(self.movies.apply(tf.data.experimental.dense_to_ragged_batch(len(self.movies))))[0]
         self.unique_movie_titles = np.unique(all_movies['movie_title'])
@@ -186,7 +192,23 @@ class MovieLensTrainer:
         self.additional_feature_info = {'timestamp_buckets': np.linspace(self.min_timestamp, self.max_timestamp,
                                                                          num=1000),
                                         'unique_movie_genres': self.unique_movie_genres,
-                                        'bucketized_user_age': self.all_ratings['bucketized_user_age']}
+                                        'bucketized_user_age': self.all_ratings['bucketized_user_age'],
+                                        'movie_length': self.all_ratings['movie_length']}
+
+    def get_datasets(self):
+        movies_data_path = './datasets/movies_data'
+        ratings_data_path = './datasets/ratings_data'
+        if os.path.exists(movies_data_path) and os.path.exists(ratings_data_path):
+            self.movies = tf.data.Dataset.load(movies_data_path)
+            self.ratings = tf.data.Dataset.load(ratings_data_path)
+        else:
+            self.movies = add_movie_length_to_dataset(tfds.load("movielens/1m-movies", split="train")
+                                                      .map(lambda x: {**x, 'movie_title_text': x['movie_title']}))
+            self.ratings = (add_movie_length_to_dataset(tfds.load("movielens/1m-ratings", split="train")
+                                                        .map(lambda x: {**x, 'movie_title_text': x['movie_title']}))
+                            .shuffle(100_000, seed=42, reshuffle_each_iteration=False))
+            tf.data.Dataset.save(self.movies, movies_data_path)
+            tf.data.Dataset.save(self.ratings, ratings_data_path)
 
     def train_all_models(self):
         models = {}
@@ -233,10 +255,10 @@ class MovieLensTrainer:
         tf.saved_model.save(model, f'{folder_name}/model')
         with open(f'{folder_name}/model_history.pkl', 'wb') as f:
             pickle.dump(model_history.history, f)
-        return model, model_history.history
+        return tf.saved_model.load(f'{folder_name}/model'), model_history.history
 
 
-def plot_training_runs(model_histories):
+def plot_training_runs(model_histories, datapane_token=None):
     first_key = list(model_histories.keys())[0]
     num_validation_runs = len(model_histories[first_key]["val_factorized_top_k/top_100_categorical_accuracy"])
     epochs = [(x + 1) * 5 for x in range(num_validation_runs)]
@@ -245,6 +267,21 @@ def plot_training_runs(model_histories):
         fig.add_trace(go.Scatter(x=epochs, y=v["val_factorized_top_k/top_100_categorical_accuracy"],
                                  mode='lines',
                                  name='_'.join(k)))
+    fig.update_layout(
+        title="TFRS model comparison on MovieLens-1M",
+        xaxis_title="epoch",
+        yaxis_title="validation top-100 accuracy",
+        legend_title="Features used",
+        font=dict(
+            family="Courier New, monospace",
+            size=12,
+            color="RebeccaPurple"
+        )
+    )
+    if datapane_token is not None:
+        import datapane as dp
+        os.system(f'datapane login --token={datapane_token}')
+        dp.Report(dp.Plot(fig)).upload(name="MovieLens-1M TFRS")
     return fig
 
 
@@ -256,9 +293,9 @@ if __name__ == '__main__':
     parser.add_argument('--additional_feature_sets', nargs='+', help='options: timestamp', action='append')
     parser.add_argument('--generate_recommendations_for_user', type=int, default=42)
     parser.add_argument('--retrain', action='store_true')
+    parser.add_argument('--datapane_token')
     args = parser.parse_args()
 
-    tf.data.experimental.enable_debug_mode
     if ['None'] in args.additional_feature_sets:
         args.additional_feature_sets.remove(['None'])
         args.additional_feature_sets.append([])
@@ -271,23 +308,27 @@ if __name__ == '__main__':
                                          args.additional_feature_sets,
                                          args.retrain)
     models = movielens_trainer.train_all_models()
-    fig = plot_training_runs({k: v[1] for k, v in models.items()})
+    fig = plot_training_runs({k: v[1] for k, v in models.items()}, args.datapane_token)
     fig.show()
 
     print(f'Run settings: {vars(args)}')
     if args.generate_recommendations_for_user:
+        print(f'These are the ratings for user {args.generate_recommendations_for_user}:')
+        user_ratings_df = tfds.as_dataframe(movielens_trainer.ratings
+                                            .filter(lambda x: x['user_id'] ==
+                                                              str(args.generate_recommendations_for_user)))
+        user_ratings_df.sort_values('user_rating', ascending=False).to_csv('user_1_ratings.csv', index=False)
         for model_name, model_obj in models.items():
             rating_idx = tf.where(movielens_trainer.all_ratings['user_id'] ==
                                   str(args.generate_recommendations_for_user).encode()).numpy().squeeze()[0]
             user_details_for_query = {'user_id': [movielens_trainer.all_ratings['user_id'][rating_idx].numpy().decode()],
                                       **{col_name: [movielens_trainer.all_ratings[col_name][rating_idx].numpy()]
-                                         for col_name in model_name}}
+                                         for col_name in model_name if col_name in USER_FEATURES}}
             model = model_obj[0]
             index = tfrs.layers.factorized_top_k.BruteForce()
-            index.index_from_dataset(movielens_trainer.movies.apply(tf.data.experimental.dense_to_ragged_batch(100)).map(model.candidate_model))
+            index.index_from_dataset(movielens_trainer.movies
+                                     .apply(tf.data.experimental.dense_to_ragged_batch(100)).map(model.candidate_model))
             _, titles = index(model.query_model(user_details_for_query))
             title_names = np.array([movielens_trainer.unique_movie_titles[x] for x in titles.numpy().squeeze()])
             print(f"Recommendations for model {model_name}, user {args.generate_recommendations_for_user}:\n"
                   f" {title_names[:10]}")
-
-
